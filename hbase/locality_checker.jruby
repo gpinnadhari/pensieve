@@ -1,0 +1,162 @@
+
+# Based on http://clayb.net/blog/finding-hbase-region-locations/
+
+# ============================================================
+# Usage and sample output
+# =============================================================
+# [hbase@node1 ~]$ hbase shell locality_checker.jruby | sed -e '1,/second/d' | sort -V  | column -t
+# 0.0                                              HASHCACHE.LHS
+# 0.0                                              HASHCACHE.RHS
+# 0.0                                              OM
+# 0.0                                              SYSTEM.CATALOG
+# 0.0                                              SYSTEM.STATS
+# 0.0                                              TEST
+# 0.0                                              TEST1
+# 0.0                                              tab2
+# 0.0                                              table1
+# 0.125                                            TestTable2
+# 0.285714285714286                                TestTable
+# 1.0                                              emp
+
+# ============================================================
+# Output interpretation
+# ============================================================
+# Output will be of the form :
+#   LocalityIndex <space> TableName1
+#   LocalityIndex <space> TableName2
+#
+# LocalityIndex of 1.0 implies 100% of data is local
+# LocalityIndex of n/a implies table is empty / disabled / Phoneix-System-Table
+# Should the table be offline, deleted (TableNotFoundException), an HDFS block moved, etc. the exception will be swallowed.
+
+
+require 'set'
+include Java
+import org.apache.hadoop.hbase.HBaseConfiguration
+import org.apache.hadoop.hbase.HColumnDescriptor
+import org.apache.hadoop.hbase.HConstants
+import org.apache.hadoop.hbase.HTableDescriptor
+import org.apache.hadoop.hbase.client.HBaseAdmin
+import org.apache.hadoop.hbase.client.HTable
+import org.apache.hadoop.hbase.TableName
+import org.apache.hadoop.io.Text
+
+import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.fs.Path
+import java.util.NoSuchElementException
+import java.io.FileNotFoundException
+
+# Return a Hash of region UUIDs to hostnames with column family stubs
+#
+# tableName - table to return regions for
+#
+# Example
+# getRegionUUIDs "TestTable"
+# # => {"3fe594363a2c13a3550f752db147194b"=>{"host" => "r1n1.example.com", "cfs" => {"f1" => {}, "f2" => {}},
+#       "da19a80cc403daa9a8f82ac9a1253e9d"=>{"host" => "r1n2.example.com", "cfs" => {"f1" => {}, "f2" => {}}}}
+#
+def getRegionUUIDs(tableName)
+  c = HBaseConfiguration.new()
+  tableNameObj = TableName.valueOf(tableName)
+  t = HTable.new(c, tableNameObj)
+  regions = t.getRegionsInRange(t.getStartKeys[0],
+                                t.getEndKeys[t.getEndKeys.size-1])
+  # get all column families -- XXX do all regions have to host all CF's?
+  cfs = HTable.new(c, tableNameObj).getTableDescriptor.getFamilies().map{ |cf| cf.getNameAsString() }
+
+  r_to_host = regions.map{|r| [r.getRegionInfo().getEncodedName(), Hash["host" => r.getHostname(), "cfs" => Hash[cfs.map{|cf| [cf, Hash.new()] }]]] }
+
+  Hash[r_to_host]
+end
+
+def findHDFSBlocks(regions, tableName)
+  # augment regions with HDFS block locations
+  augmented = regions.clone
+  c = HBaseConfiguration.new()
+  fs = FileSystem.newInstance(c)
+  hbase_rootdir = c.select{|r| r.getKey() == "hbase.rootdir"}.first.getValue
+  tableNameObj = TableName.valueOf(tableName)
+  nameSpace = tableNameObj.getNamespaceAsString
+  baseTableName = tableNameObj.getQualifierAsString
+  # use the default namespace if nongiven
+  nameSpace = "default" if nameSpace == tableName
+
+  regions.each do |r, values|
+    values["cfs"].keys().each do |cf|
+      rPath = Path.new(Pathname.new(hbase_rootdir).join("data", nameSpace, baseTableName, r, cf).to_s)
+      begin
+        files = fs.listFiles(rPath, true)
+      rescue java.io.FileNotFoundException
+        next
+      end
+
+      begin
+        begin
+          fStatus = files.next()
+          hosts = fStatus.getBlockLocations().map { |block| Set.new(block.getHosts().to_a) }
+          augmented[r]["cfs"][cf][File.basename(fStatus.getPath().toString())] = hosts
+        rescue NativeException, java.util.NoSuchElementException
+          fStatus = false
+        end
+      end until fStatus == false
+    end
+  end
+  augmented
+end
+
+def computeLocalityByBlock(regions)
+  non_local_blocks = []
+  regions.each do |r, values|
+    values["cfs"].each do |cf, hFiles|
+      hFiles.each do |id, blocks|
+        blocks.each_index do |idx|
+          non_local_blocks.push(Pathname.new(r).join(cf, id, idx.to_s).to_s) unless blocks[idx].include?(values["host"])
+        end
+      end
+    end
+  end
+  non_local_blocks
+end
+
+def totalBlocks(regions)
+  regions.map do |r, values|
+    values["cfs"].map do |cf, hFiles|
+      hFiles.map do |id, blocks|
+        blocks.count
+      end
+    end
+  end.flatten().reduce(0, :+)
+end
+
+tables = list
+
+puts "* Total tables count = " + tables.count.to_s
+
+tables.each do |tableName|
+  begin
+    # Get encoded region name
+    regions = getRegionUUIDs(tableName)
+
+    # Find all blocks of region
+    hdfs_blocks_by_region = findHDFSBlocks(regions, tableName)
+
+    # Find total blocks count
+    total_blocks = totalBlocks(hdfs_blocks_by_region)
+
+    # Find non-local blocks count
+    non_local_blocks = computeLocalityByBlock(hdfs_blocks_by_region)
+
+    if total_blocks > 0 # e.g. if table not empty or disabled
+      print 1 - non_local_blocks.length().to_f/total_blocks
+    else
+      print "n/a"
+    end
+    print " "
+    puts tableName
+
+  rescue org.apache.hadoop.hbase.TableNotFoundException
+    true
+  end
+end
+
+exit
